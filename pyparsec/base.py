@@ -46,7 +46,10 @@ ParseResult = namedtuple("ParseResult", ["succeeded", "value", "rest", "expects"
 #
 # The provided parsers are enough to make a regular grammar (they are as expressive as regular expressions). In general, a parser is an arbitrary
 # partial function and can parse anything. The implementation here is simplistic and doesn't really handle ambiguous or pathological parses. It also
-# doesn't backtrack, so `(a | ab) c` will fail to parse `abc`.
+# doesn't fully backtrack, so `many(a) + ab` will fail to parse `aab`, despite matching the grammar `a*ab`. Arbitrary backtracking like this would
+# require try_parse() to return all possible partial parses rather than a single one, which is doable but substantially increases the complexity of
+# any parser with children. I think that in practice most parsers which are suceptible to this can be trivially rewritten to a form which isn't,
+# e.g., `a + many(a) + b` has the same grammar (though a slightly different output value) and avoids the issue.
 
 
 def fail(expects, remaining=None):
@@ -88,15 +91,19 @@ class Parser:
     def __ror__(self, other):
         return or_(_coerce(other), self)
 
-# todo: __mul__
+    def __mul__(self, n):
+        return seq(*(self for i in range(n)))
+
+    def __invert__(self):
+        return not_(self)
+
+
 
 def _coerce(obj):
     if isinstance(obj, Parser):  # Already a parser
         return obj
-    elif isinstance(obj, (str, bytes)):  # String-like
-        if len(obj) == 0:  # Empty sequence
-            return seq()
-        elif len(obj) == 1:  # Token
+    elif isinstance(obj, str):  # String-like
+        if len(obj) == 1:  # Token
             return only(obj)
         else:  # Sequence of tokens
             return seq(*(only(c) for c in obj))
@@ -104,6 +111,9 @@ def _coerce(obj):
         return seq(*(_coerce(x) for x in obj))
     else:  # Treat it as a token
         return only(obj)
+
+def parser(x):
+    return _coerce(x)
 
 
 class only(Parser):
@@ -114,6 +124,7 @@ class only(Parser):
         if components and self._v == components[0]:
             return ParseResult(True, components[0], components[1:], [])
         return fail([self._v], components)
+
 
 
 class Flattens:
@@ -242,12 +253,33 @@ def transform_possible(f):
 
 
 class any_(Parser):
-    def __init__(self, fake_name):
-        self._fake_name = fake_name
+    def __init__(self, fake_name=None):
+        self._fake_name = fake_name if fake_name is not None else ''
+
     def try_parse(self, components):
         if components:
             return ParseResult(True, components[0], components[1:], [])
         return fail([self._fake_name], components)
+
+class not_(Parser):  # Fails if p succeeds, and succeeds (consuming n tokens) if p fails and there are at least n tokens left
+    def __init__(self, p, n=0, fake_name=None):
+        self._n = n
+        self._p = p
+        self._fake_name = fake_name if fake_name is not None else ''
+
+    def try_parse(self, components):
+        if self._p.try_parse(components).succeeded or len(components) < self._n:
+            return fail([self._fake_name], components)
+        else:
+            return ParseResult(True, components[:self._n], components[self._n:], [])
+
+def not1(p, fake_name=None):
+    return exl(not_(p, n=1, fake_name=fake_name))
+
+
+# Note that not_(not_(p)) is not equivalent to p, but rather will test for p and not consume any input.
+
+
 
 
 @transform
