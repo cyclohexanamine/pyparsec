@@ -3,7 +3,50 @@ from collections import namedtuple, defaultdict
 import logging
 logger = logging.getLogger(__name__)
 
-ParseResult = namedtuple("ParseResult", ["succeeded", "value", "rest", "expects"])
+ParseResult = namedtuple("ParseResult", ["succeeded", "value", "rest", "expects"])  # todo: expects description vs. values
+
+
+# ## General scheme:
+#
+# We want to parse some sequence of tokens, according to a grammar, into a value. A parser has a grammar (patterns of tokens which it accepts),
+# and a transformation with which it will turn acceptable inputs into output values. The transformation may be, e.g., the identity, in which case
+# the result will be more or less a parse tree; or it may do some more work, e.g., evaluating an arithmetic expression. Parsers can be combined
+# by, e.g., concatenation or alternation, to build up complex grammars from simple ones.
+#
+# For some Parser `p`, `p.try_parse(seq)` -> `r` - try to (partially) parse `seq` with `p`.
+# `seq` should be list-like, with elements of arbitrary type. `r` will be a ParseResult, which will be successful if `p` accepted some prefix of `seq`.
+# If successful, `value` will be the transformed result, and `rest` will be the remaining suffix of `seq`. If unsuccessful, then `expects` will be
+# a list of tokens which could have continued the parse (in some sense - this isn't very well-defined and is only used for feedback messages).
+# `p.parse(seq)` will _completely_ parse `seq`, returns only the result value, and throws an exception if the parse was not successful (including
+# if there is anything left over).
+#
+# The basic parser is `only(x)` - this is a parser which matches a sequence `[y]` where `x == y`. e.g.,
+#   `only(1).try_parse([1, 2])` -> `ParseResult(succeeded=True,  rest=[2],    value=1)`
+#   `only(3).try_parse([1, 2])` -> `ParseResult(succeeded=False, rest=[1, 2], expects=[1])`
+# Other important parsers are
+# * seq(), concatenating parsers -
+#   `seq(only(1), only(2)).try_parse([1, 2])` -> `ParseResult(succeeded=True, rest=[], value=[1, 2])`
+# * or_(), alternating -
+#   `or_(only(1), only(3)).try_parse([1, 2])` -> `ParseResult(succeeded=True, rest=[2], value=1)`
+#   `or_(only(1), only(3)).try_parse([3, 2])` -> `ParseResult(succeeded=True, rest=[2], value=3)`
+# * optional(), making a parser optional -
+#   `optional(only(1)).try_parse([2])`    -> `ParseResult(succeeded=True, rest=[2], value=None)`
+#   `optional(only(1)).try_parse([1, 2])` -> `ParseResult(succeeded=True, rest=[2], value=1)`
+# * many(), repeating a parser -
+#   `many(only(1)).try_parse([2])`       -> `ParseResult(succeeded=True, rest=[2], value=[])`
+#   `many(only(1)).try_parse([1, 2])`    -> `ParseResult(succeeded=True, rest=[2], value=[1])`
+#   `many(only(1)).try_parse([1, 1, 2])` -> `ParseResult(succeeded=True, rest=[2], value=[1, 1])`
+#
+# Parsers support arithmetic-like operations, and will implicitly convert non-parsers into parsers when doing this. e.g.,
+# `(only('a') | 'bc') + 'def'` will fully match either 'adef' or 'bcdef'. Note that the list-like strings 'bc' and 'def' are
+# treated as sequences of tokens and not individual tokens - this parser will _not_ match ['bc', 'def']. To use list-like types as individual
+# tokens, you'd need to use the constructors explicitly, e.g., `seq(or_(only('a'), only('bc')), only_('def')`.
+#
+# Transformers liked named() apply transformations to the output value of a parser, while leaving the grammar unchanged.
+#
+# The provided parsers are enough to make a regular grammar (they are as expressive as regular expressions). In general, a parser is an arbitrary
+# partial function and can parse anything. The implementation here is simplistic and doesn't really handle ambiguous or pathological parses. It also
+# doesn't backtrack, so `(a | ab) c` will fail to parse `abc`.
 
 
 def fail(expects, remaining=None):
@@ -33,59 +76,94 @@ class Parser:
 
         return []
 
+    def __add__(self, other):
+        return seq(self, _coerce(other))
+
+    def __radd__(self, other):
+        return seq(_coerce(other), self)
+
+    def __or__(self, other):
+        return or_(self, _coerce(other))
+
+    def __ror__(self, other):
+        return or_(_coerce(other), self)
+
+# todo: __mul__
+
+def _coerce(obj):
+    if isinstance(obj, Parser):  # Already a parser
+        return obj
+    elif isinstance(obj, (str, bytes)):  # String-like
+        if len(obj) == 0:  # Empty sequence
+            return seq()
+        elif len(obj) == 1:  # Token
+            return only(obj)
+        else:  # Sequence of tokens
+            return seq(*(only(c) for c in obj))
+    elif hasattr(obj, '__iter__'):  # List-like: treat it as a sequence
+        return seq(*(_coerce(x) for x in obj))
+    else:  # Treat it as a token
+        return only(obj)
+
 
 class only(Parser):
     def __init__(self, v):
         self._v = v
 
     def try_parse(self, components):
-        if components and components[0] == self._v:
+        if components and self._v == components[0]:
             return ParseResult(True, components[0], components[1:], [])
         return fail([self._v], components)
 
 
-class one_of(Parser):
-    def __init__(self, values):
-        self._values = values
+class Flattens:
+    # Flattens([a, Flattens([b, c])])  ->  Flattens([a, b, c])
+    # This is an optimisation for seq() and or_() to avoid deep nesting, e.g., a + b + c + d becomes a single seq()
+    # of four elements, rather than three nested seq()s with two elements each.
+    def __init__(self, parsers):
+        flat_parsers = []
+        for p in parsers:
+            if isinstance(p, type(self)):
+                flat_parsers += p.children
+            elif isinstance(p, Parser):
+                flat_parsers += [p]
+            else:
+                raise ValueError(type(p))
+        self.children = flat_parsers
 
-    def try_parse(self, components):
-        if components and components[0] in self._values:
-            return ParseResult(True, components[0], components[1:], [])
-        return fail(self._values, components)
 
-
-class or_(Parser):
+class or_(Flattens, Parser):
     def __init__(self, *parsers):
-        self._parsers = parsers
+        Flattens.__init__(self, parsers)
 
     def try_parse(self, components):
-        for p in self._parsers:
+        for p in self.children:
             r = p.try_parse(components)
             if r.succeeded:
                 return r
-        if self._parsers:
+        if self.children:
             return r
         else:
             return fail([])
 
     def possible_next(self, components):
         res = []
-        for p in self._parsers:
+        for p in self.children:
             for ex in p.possible_next(components):
                 if ex not in res:
                     res.append(ex)
         return res
 
 
-class seq_(Parser):
+class seq(Flattens, Parser):
     def __init__(self, *parsers, throw_away=None):
-        self._parsers = parsers
+        Flattens.__init__(self, parsers)
         self._throw_away = throw_away
 
     def try_parse(self, components):
         remaining_components = list(components)
         values = []
-        for p in self._parsers:
+        for p in self.children:
             r = p.try_parse(remaining_components)
             if not r.succeeded:
                 return ParseResult(False, [v for v in values if v != self._throw_away], r.rest, r.expects)
@@ -96,7 +174,7 @@ class seq_(Parser):
     def possible_next(self, components):
         res = []
         remaining_components = list(components)
-        for i,p in enumerate(self._parsers):
+        for i,p in enumerate(self.children):
             res += p.possible_next(remaining_components)
             r = p.try_parse(remaining_components)
             if not r.succeeded:
@@ -220,41 +298,4 @@ class many(Parser):
             remaining_components = r.rest
 
         return self._p.possible_next(remaining_components)
-
-
-class many_of(Parser):
-    def __init__(self, parsers_with_max):
-        self._parsers_with_max = parsers_with_max
-
-    def _advance_state(self, components):
-        values = []
-        remaining_components = list(components)
-        remaining_parsers = list(self._parsers_with_max)
-        while remaining_components:
-            if not any(c is None or c > 0 for p, c in remaining_parsers):
-                break
-
-            for i, (p, count) in list(enumerate(remaining_parsers)):
-                if count is not None and count <= 0:
-                    continue
-
-                r = p.try_parse(remaining_components)
-                if r.succeeded:
-                    values.append(r.value)
-                    remaining_components = r.rest
-                    remaining_parsers[i] = (p, count-1 if count is not None else None)
-                    break
-            else:
-                break
-
-        return values, remaining_components, remaining_parsers
-
-    def try_parse(self, components):
-        values, remaining_components, _ = self._advance_state(components)
-        return ParseResult(True, values, remaining_components, [])
-
-    def possible_next(self, components):
-        _, remaining_components, remaining_parsers = self._advance_state(components)
-        remaining_combinator = or_(*[p for p, c in remaining_parsers if c is None or c > 0])
-        return remaining_combinator.possible_next(remaining_components)
 
